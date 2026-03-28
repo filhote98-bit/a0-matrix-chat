@@ -173,6 +173,41 @@ class ChatBridgeBot:
             logger.warning("Could not generate API token: %s", e)
             return ''
 
+    def _mxc_to_http(self, mxc_url: str) -> str:
+        """Convert mxc://server/media_id to HTTP download URL."""
+        if not mxc_url.startswith('mxc://'):
+            return mxc_url
+        parts = mxc_url[6:].split('/', 1)  # server_name/media_id
+        if len(parts) != 2:
+            return mxc_url
+        server_name, media_id = parts
+        return f"{self.homeserver}/_matrix/media/v3/download/{server_name}/{media_id}"
+
+    async def _download_media(self, mxc_url: str, filename: str) -> dict:
+        """Download media from Matrix and return as {filename, base64} dict."""
+        import aiohttp
+        http_url = self._mxc_to_http(mxc_url)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                http_url,
+                timeout=aiohttp.ClientTimeout(total=60),
+                headers={'Authorization': f'Bearer {self.access_token}'} if self.access_token else {},
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("Media download failed: %s -> %d", mxc_url, resp.status)
+                    return None
+                data = await resp.read()
+                # Limit file size to 20MB
+                if len(data) > 20 * 1024 * 1024:
+                    logger.warning("Media too large: %s (%d bytes)", filename, len(data))
+                    return None
+                import base64 as b64mod
+                return {
+                    "filename": filename,
+                    "base64": b64mod.b64encode(data).decode('ascii'),
+                }
+
+
     def _get_config(self) -> dict:
         try:
             from usr.plugins.matrix_chat.helpers.matrix_client import get_matrix_config
@@ -318,10 +353,14 @@ class ChatBridgeBot:
     # ------------------------------------------------------------------
 
     async def _on_room_message(self, room_id: str, event):
-        """Handle incoming m.room.message events."""
-        from nio import RoomMessageText
+        """Handle incoming m.room.message events (text, images, files, audio, video)."""
+        from nio import (RoomMessageText, RoomMessageImage, RoomMessageFile,
+                         RoomMessageAudio, RoomMessageVideo)
 
-        if not isinstance(event, RoomMessageText):
+        is_text = isinstance(event, RoomMessageText)
+        is_media = isinstance(event, (RoomMessageImage, RoomMessageFile,
+                                       RoomMessageAudio, RoomMessageVideo))
+        if not is_text and not is_media:
             return
 
         # Ignore own messages
@@ -330,7 +369,26 @@ class ChatBridgeBot:
 
         sender = event.sender
         body = event.body or ""
-        if not body.strip():
+        
+        # For media events, construct a description if body is just a filename
+        media_attachments = []  # list of {"filename": str, "base64": str}
+        if is_media:
+            media_url = getattr(event, 'url', '') or ''  # mxc:// URL
+            media_body = getattr(event, 'body', '') or 'file'
+            if not body.strip():
+                body = f"[Datei gesendet: {media_body}]"
+            else:
+                body = f"[Datei: {media_body}] {body}"
+            # Download media
+            if media_url:
+                try:
+                    dl_result = await self._download_media(media_url, media_body)
+                    if dl_result:
+                        media_attachments.append(dl_result)
+                        logger.info("Downloaded media: %s (%d bytes)", media_body, len(dl_result.get('base64', '')))
+                except Exception as e:
+                    logger.warning("Failed to download media %s: %s", media_url, e)
+        elif not body.strip():
             return
 
         room_list = get_room_list()
@@ -419,11 +477,13 @@ class ChatBridgeBot:
         try:
             if is_elevated:
                 response_text = await self._get_elevated_response(
-                    room_id, body, sender, display_name
+                    room_id, body, sender, display_name,
+                    attachments=media_attachments
                 )
             else:
                 response_text = await self._get_agent_response(
-                    room_id, body, sender, display_name
+                    room_id, body, sender, display_name,
+                    attachments=media_attachments
                 )
         except Exception as e:
             logger.error("Agent error: %s", type(e).__name__, exc_info=True)
@@ -441,7 +501,8 @@ class ChatBridgeBot:
     # ------------------------------------------------------------------
 
     async def _get_agent_response(self, room_id: str, text: str,
-                                   sender: str, display_name: str) -> str:
+                                   sender: str, display_name: str,
+                                   attachments: list = None) -> str:
         try:
             from agent import AgentContext, AgentContextType
             from initialize import initialize_agent
@@ -488,14 +549,15 @@ class ChatBridgeBot:
             return response if isinstance(response, str) else str(response)
 
         except ImportError:
-            return await self._get_agent_response_http(room_id, text, sender, display_name)
+            return await self._get_agent_response_http(room_id, text, sender, display_name, attachments=attachments)
 
     # ------------------------------------------------------------------
     # HTTP fallback: route through Agent Zero's HTTP API
     # ------------------------------------------------------------------
 
     async def _get_agent_response_http(self, room_id: str, text: str,
-                                        sender: str, display_name: str) -> str:
+                                        sender: str, display_name: str,
+                                        attachments: list = None) -> str:
         """Fallback: route through Agent Zero's HTTP API when framework imports fail."""
         import aiohttp
 
@@ -515,6 +577,8 @@ class ChatBridgeBot:
         try:
             async with aiohttp.ClientSession() as session:
                 payload = {"message": prefixed_text, "context_id": context_id}
+                if attachments:
+                    payload["attachments"] = attachments
                 headers = {"Content-Type": "application/json", "X-API-KEY": self._get_api_token()}
 
                 async with session.post(
@@ -541,7 +605,8 @@ class ChatBridgeBot:
     # ------------------------------------------------------------------
 
     async def _get_elevated_response(self, room_id: str, text: str,
-                                      sender: str, display_name: str) -> str:
+                                      sender: str, display_name: str,
+                                      attachments: list = None) -> str:
         try:
             from agent import AgentContext, AgentContextType, UserMessage
             from initialize import initialize_agent
@@ -566,7 +631,7 @@ class ChatBridgeBot:
             return result if isinstance(result, str) else str(result)
 
         except ImportError:
-            return await self._get_agent_response_http(room_id, text, sender, display_name)
+            return await self._get_agent_response_http(room_id, text, sender, display_name, attachments=attachments)
         except Exception as e:
             logger.error("Elevated mode error: %s", type(e).__name__, exc_info=True)
             set_context_id(room_id, "")
@@ -653,7 +718,10 @@ def _run_bot_in_thread(bot: ChatBridgeBot, ready_event: threading.Event):
     bot._ready_event = ready_event
 
     try:
-        from nio import AsyncClient, LoginResponse, RoomMessageText, SyncResponse
+        from nio import (AsyncClient, LoginResponse, RoomMessageText, RoomMessageImage,
+                         RoomMessageFile, RoomMessageAudio, RoomMessageVideo, SyncResponse)
+        _media_types = (RoomMessageText, RoomMessageImage, RoomMessageFile,
+                        RoomMessageAudio, RoomMessageVideo)
 
         async def _start():
             client = AsyncClient(bot.homeserver, bot.user_id)
@@ -700,7 +768,7 @@ def _run_bot_in_thread(bot: ChatBridgeBot, ready_event: threading.Event):
                         # Process room events
                         for room_id, room_info in resp.rooms.join.items():
                             for event in room_info.timeline.events:
-                                if isinstance(event, RoomMessageText):
+                                if isinstance(event, _media_types):
                                     try:
                                         await bot._on_room_message(room_id, event)
                                     except Exception as e:
