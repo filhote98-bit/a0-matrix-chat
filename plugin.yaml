@@ -1,0 +1,9 @@
+name: matrix_chat
+title: Matrix Chat Integration
+description: Chat with Agent Zero via Matrix protocol. Supports chat bridge with restricted and elevated modes.
+version: 1.0.0
+settings_sections:
+  - external
+per_project_config: true
+per_agent_config: true
+always_enabled: false

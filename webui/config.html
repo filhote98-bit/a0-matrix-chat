@@ -1,0 +1,221 @@
+<html>
+<head><title>Matrix Chat</title></head>
+<body>
+    <div x-data x-init="
+        if (!config.server) config.server = {};
+        if (!config.defaults) config.defaults = {};
+        if (!config.memory) config.memory = {};
+        if (!config.chat_bridge) config.chat_bridge = {};
+        if (config.allowed_rooms === undefined) config.allowed_rooms = [];
+    ">
+        <template x-if="config">
+            <div>
+                <!-- Server Connection -->
+                <div class="section-title">Matrix Server</div>
+                <div class="section-description">
+                    Configure your Matrix homeserver and bot account credentials.
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Homeserver URL</div>
+                        <div class="field-description">The Matrix homeserver URL (e.g. https://matrix.org).</div>
+                    </div>
+                    <div class="field-control">
+                        <input type="text" x-model="config.server.homeserver" placeholder="https://matrix.org" />
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">User ID</div>
+                        <div class="field-description">The bot's Matrix user ID (e.g. @bot:matrix.org).</div>
+                    </div>
+                    <div class="field-control">
+                        <input type="text" x-model="config.server.user_id" placeholder="@bot:matrix.org" />
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Access Token</div>
+                        <div class="field-description">Preferred authentication method. Get from Element: Settings → Help & About → Access Token.</div>
+                    </div>
+                    <div class="field-control">
+                        <input type="password" x-model="config.server.access_token" placeholder="syt_..." />
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Password</div>
+                        <div class="field-description">Fallback if no access token is set. The bot will login with password.</div>
+                    </div>
+                    <div class="field-control">
+                        <input type="password" x-model="config.server.password" placeholder="Password (optional)" />
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Device Name</div>
+                        <div class="field-description">Display name for the bot's device in Matrix sessions.</div>
+                    </div>
+                    <div class="field-control">
+                        <input type="text" x-model="config.server.device_name"
+                            x-init="if (!config.server.device_name) config.server.device_name = 'AgentZero'"
+                            placeholder="AgentZero" />
+                    </div>
+                </div>
+
+                <!-- Access Control -->
+                <div class="section-title">Access Control</div>
+                <div class="section-description">
+                    Restrict which Matrix rooms can use the plugin tools.
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Allowed Room IDs</div>
+                        <div class="field-description">One per line (e.g. !abc123:matrix.org). Leave empty to allow all rooms.</div>
+                    </div>
+                    <div class="field-control">
+                        <textarea rows="3"
+                            :value="(config.allowed_rooms || []).join('\n')"
+                            @input="config.allowed_rooms = $event.target.value.split('\n').map(s => s.trim()).filter(Boolean)"
+                            placeholder="Leave empty for all rooms"></textarea>
+                    </div>
+                </div>
+
+                <!-- Memory -->
+                <div class="section-title">Memory</div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Auto-save summaries</div>
+                        <div class="field-description">Automatically save conversation summaries to agent memory.</div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.memory.auto_save_summaries"
+                                x-init="if (config.memory.auto_save_summaries === undefined) config.memory.auto_save_summaries = true" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Chat Bridge -->
+                <div class="section-title">Chat Bridge</div>
+                <div class="section-description">
+                    Route Matrix messages through Agent Zero's LLM. Rooms are managed via the <code>matrix_chat</code> tool.
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Auto-start on agent startup</div>
+                        <div class="field-description">Automatically connect the bot when Agent Zero starts.</div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.chat_bridge.auto_start" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">User Allowlist</div>
+                        <div class="field-description">Only these Matrix user IDs can interact with the bot. Leave empty to allow all. Format: @user:server.org</div>
+                    </div>
+                    <div class="field-control">
+                        <textarea rows="3"
+                            :value="(config.chat_bridge.allowed_users || []).join('\n')"
+                            @input="config.chat_bridge.allowed_users = $event.target.value.split('\n').map(s => s.trim()).filter(Boolean)"
+                            placeholder="One user ID per line"></textarea>
+                    </div>
+                </div>
+
+                <!-- Elevated Mode -->
+                <div class="section-title">Elevated Mode (2FA)</div>
+                <div class="section-description">
+                    When enabled, users can unlock full Agent Zero access via <code>!auth &lt;key&gt;</code>.
+                    Default mode is restricted (chat only, no tools).
+                </div>
+
+                <div class="field">
+                    <div class="field-label">
+                        <div class="field-title">Allow elevated mode</div>
+                        <div class="field-description">Grants authenticated users full agent access including code execution and file operations.</div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle">
+                            <input type="checkbox" x-model="config.chat_bridge.allow_elevated" />
+                            <span class="toggler"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <template x-if="config.chat_bridge.allow_elevated">
+                    <div>
+                        <div style="background: var(--bg-warning, #fce4ec); border: 1px solid var(--border-warning, #ef9a9a); border-radius: 6px; padding: 10px; margin-bottom: 12px;">
+                            <div style="font-size: 12px; font-weight: 700; color: var(--text-error, #c62828); margin-bottom: 4px;">Security Notice</div>
+                            <div style="font-size: 11px; color: var(--text-error, #b71c1c); line-height: 1.5;">
+                                Elevated mode grants full access to Agent Zero. Use a private room, define a User Allowlist, and use short session timeouts.
+                            </div>
+                        </div>
+
+                        <div class="field">
+                            <div class="field-label">
+                                <div class="field-title">Auth Key</div>
+                                <div class="field-description">Users send <code>!auth &lt;key&gt;</code> in Matrix to elevate. Share securely.</div>
+                            </div>
+                            <div class="field-control" style="display: flex; gap: 6px; align-items: center;">
+                                <input type="text" x-model="config.chat_bridge.auth_key" readonly
+                                    style="font-family: monospace; flex: 1;" />
+                                <button class="btn btn-field" @click="
+                                    (globalThis.fetchApi || fetch)('/api/plugins/matrix_chat/matrix_config_api', {
+                                        method: 'POST',
+                                        headers: {'Content-Type': 'application/json'},
+                                        body: JSON.stringify({action: 'generate_auth_key'})
+                                    }).then(r => r.json()).then(d => { if (d.auth_key) config.chat_bridge.auth_key = d.auth_key; })
+                                ">Regenerate</button>
+                                <button class="btn btn-field" @click="
+                                    navigator.clipboard.writeText(config.chat_bridge.auth_key || '').then(() => {
+                                        $event.target.textContent = 'Copied!';
+                                        setTimeout(() => $event.target.textContent = 'Copy', 2000);
+                                    })
+                                ">Copy</button>
+                            </div>
+                        </div>
+
+                        <div class="field">
+                            <div class="field-label">
+                                <div class="field-title">Session Timeout</div>
+                                <div class="field-description">How long elevated sessions last before requiring re-authentication.</div>
+                            </div>
+                            <div class="field-control">
+                                <select x-model.number="config.chat_bridge.session_timeout"
+                                    x-init="if (config.chat_bridge.session_timeout === undefined) config.chat_bridge.session_timeout = 300">
+                                    <option value="300">5 minutes</option>
+                                    <option value="900">15 minutes</option>
+                                    <option value="1800">30 minutes</option>
+                                    <option value="3600">1 hour</option>
+                                    <option value="7200">2 hours</option>
+                                    <option value="14400">4 hours</option>
+                                    <option value="0">Never expire</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div x-show="config.chat_bridge.session_timeout == 0"
+                            style="background: var(--bg-warning, #fff3e0); border: 1px solid var(--border-warning, #ffcc80); border-radius: 6px; padding: 8px; font-size: 11px; color: var(--text-warning, #e65100);">
+                            <strong>Warning:</strong> "Never expire" means elevated sessions stay active until bot restart or <code>!deauth</code>.
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </template>
+    </div>
+</body>
+</html>

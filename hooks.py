@@ -1,0 +1,132 @@
+"""Plugin lifecycle hooks for the Matrix Chat Integration plugin.
+
+Called by Agent Zero's plugin system during install, uninstall, and update.
+See: helpers/plugins.py -> call_plugin_hook()
+"""
+import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+logger = logging.getLogger("matrix_chat_hooks")
+
+
+def _get_plugin_dir() -> Path:
+    """Return the directory this hooks.py lives in."""
+    return Path(__file__).parent.resolve()
+
+
+def _get_a0_root() -> Path:
+    """Detect A0 root directory."""
+    if Path("/a0/plugins").is_dir():
+        return Path("/a0")
+    if Path("/git/agent-zero/plugins").is_dir():
+        return Path("/git/agent-zero")
+    return Path("/a0")
+
+
+def _find_python() -> str:
+    """Find the appropriate Python interpreter."""
+    candidates = ["/opt/venv-a0/bin/python3", sys.executable, "python3"]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return "python3"
+
+
+def install(**kwargs):
+    """Post-install hook: set up data dir, deps, toggle."""
+    plugin_dir = _get_plugin_dir()
+    a0_root = _get_a0_root()
+    plugin_name = "matrix_chat"
+
+    logger.info("Running post-install hook...")
+
+    # 1. Enable plugin
+    toggle = plugin_dir / ".toggle-1"
+    if not toggle.exists():
+        toggle.touch()
+        logger.info("Created %s", toggle)
+
+    # 2. Create data directory with restrictive permissions
+    data_dir = plugin_dir / "data"
+    data_dir.mkdir(exist_ok=True)
+    os.chmod(str(data_dir), 0o700)
+
+    # 3. Pre-create config.json with restrictive permissions (0o600).
+    config_file = plugin_dir / "config.json"
+    if not config_file.exists():
+        import json
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({}, f)
+        logger.info("Created config.json with 0o600 permissions")
+
+    # 4. Install Python dependencies via initialize.py
+    init_script = plugin_dir / "initialize.py"
+    if init_script.is_file():
+        python = _find_python()
+        try:
+            subprocess.run(
+                [python, str(init_script)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            logger.info("Dependencies installed")
+        except subprocess.CalledProcessError as e:
+            logger.warning("Dependency install failed: %s", e.stderr[:200])
+        except subprocess.TimeoutExpired:
+            logger.warning("Dependency install timed out")
+
+    # 5. Mirror to /git/agent-zero if running in /a0 runtime
+    if str(a0_root) == "/a0" and Path("/git/agent-zero/usr").is_dir():
+        git_plugin = Path("/git/agent-zero/usr/plugins") / plugin_name
+        if not git_plugin.exists():
+            try:
+                import shutil
+                shutil.copytree(str(plugin_dir), str(git_plugin))
+            except Exception:
+                pass
+
+    logger.info("Post-install hook complete")
+
+
+def save_plugin_config(settings: dict, **kwargs) -> dict:
+    """Called before the framework writes config.json.
+
+    If allow_elevated is enabled and no auth_key exists, generate one
+    immediately so the key is available in the UI without a bridge restart.
+    """
+    bridge = settings.get("chat_bridge", {})
+    if bridge.get("allow_elevated", False) and not bridge.get("auth_key", ""):
+        try:
+            from usr.plugins.matrix_chat.helpers.sanitize import generate_auth_key
+            bridge["auth_key"] = generate_auth_key()
+            settings["chat_bridge"] = bridge
+            logger.info("Auto-generated auth key on config save")
+        except Exception:
+            pass
+    return settings
+
+
+def uninstall(**kwargs):
+    """Pre-uninstall hook: clean up."""
+    a0_root = _get_a0_root()
+    plugin_name = "matrix_chat"
+
+    logger.info("Running uninstall hook...")
+
+    # Remove symlink if exists
+    symlink = a0_root / "plugins" / plugin_name
+    if symlink.is_symlink():
+        symlink.unlink()
+        logger.info("Removed symlink: %s", symlink)
+    elif symlink.is_dir():
+        import shutil
+        shutil.rmtree(str(symlink))
+        logger.info("Removed directory: %s", symlink)
+
+    logger.info("Uninstall hook complete")

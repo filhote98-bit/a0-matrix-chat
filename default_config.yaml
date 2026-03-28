@@ -1,0 +1,46 @@
+# Matrix Chat Plugin Configuration
+# Credentials can also be set via environment variables:
+#   MATRIX_HOMESERVER, MATRIX_USER_ID, MATRIX_ACCESS_TOKEN, MATRIX_PASSWORD
+
+server:
+  homeserver: ""        # e.g. https://matrix.org
+  user_id: ""           # e.g. @bot:matrix.org
+  access_token: ""      # Preferred auth method
+  password: ""          # Fallback if no access token
+  device_name: "AgentZero"  # Device display name
+
+defaults:
+  message_limit: 50
+
+# Allowed room IDs (empty = allow all)
+allowed_rooms: []
+
+memory:
+  auto_save_summaries: true
+  export_format: "markdown"
+
+# Chat bridge — Matrix as a chat frontend to Agent Zero
+chat_bridge:
+  auto_start: false
+  # Rooms are managed via the matrix_chat tool, not config
+
+  # User allowlist: only these Matrix user IDs can interact with the bot.
+  # Empty list = allow all users. Format: @user:homeserver.org
+  allowed_users: []
+
+  # Elevated mode: allows authenticated users to access the full Agent Zero
+  # agent loop (with tools, code execution, file access, etc.) via Matrix.
+  # Default is restricted mode (conversation only, no tools).
+  allow_elevated: false
+  # Auth key for elevated mode. Auto-generated on first use if left empty.
+  # Shown in WebUI settings. Required to authenticate via !auth <key> in Matrix.
+  auth_key: ""
+  # Session timeout in seconds (default: 5 minutes). Elevated sessions expire
+  # after this duration and must be re-authenticated.
+  session_timeout: 300
+
+# Security — prompt injection defense
+security:
+  max_message_length: 4096
+  sanitize_content: true
+  strip_injection_patterns: true
