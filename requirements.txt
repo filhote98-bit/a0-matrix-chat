@@ -1,0 +1,2 @@
+matrix-nio>=0.24.0
+markdown>=3.7

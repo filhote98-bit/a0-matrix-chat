@@ -137,9 +137,26 @@ class MatrixChatClient:
         await self._ensure_client()
         from nio import RoomSendResponse
 
+        # Convert Markdown to HTML for rich rendering in Matrix clients
+        try:
+            import markdown as md_lib
+            import re
+            html_body = md_lib.markdown(
+                text,
+                extensions=["nl2br", "fenced_code", "tables"],
+                output_format="html",
+            )
+            # Strip dangerous tags Matrix doesn't allow
+            html_body = re.sub(r'<(script|style|iframe|object|embed)[^>]*>.*?</\1>', '', html_body, flags=re.DOTALL|re.IGNORECASE)
+        except Exception:
+            import html as html_mod
+            html_body = html_mod.escape(text).replace('\n', '<br>')
+
         content = {
             "msgtype": msgtype,
             "body": text,
+            "format": "org.matrix.custom.html",
+            "formatted_body": html_body,
         }
 
         if reply_to_event_id:

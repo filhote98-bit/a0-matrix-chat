@@ -666,6 +666,26 @@ class ChatBridgeBot:
     # Response sending
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _markdown_to_html(md: str) -> str:
+        """Convert Markdown to safe HTML for Matrix formatted_body."""
+        try:
+            import markdown as md_lib
+            html = md_lib.markdown(
+                md,
+                extensions=["nl2br", "fenced_code", "tables"],
+                output_format="html",
+            )
+            # Sanitize: remove script/style/tags Matrix doesn't allow
+            import re
+            # Strip dangerous tags
+            html = re.sub(r'<(script|style|iframe|object|embed)[^>]*>.*?</\1>', '', html, flags=re.DOTALL|re.IGNORECASE)
+            return html
+        except Exception:
+            # Fallback: escape HTML and convert newlines
+            import html as html_mod
+            return html_mod.escape(md).replace('\n', '<br>')
+
     async def _send_response(self, room_id: str, text: str):
         if not text:
             text = "(No response)"
@@ -674,10 +694,16 @@ class ChatBridgeBot:
         for chunk in chunks:
             try:
                 from nio import RoomSendResponse
+                html_body = self._markdown_to_html(chunk)
                 resp = await self._client.room_send(
                     room_id=room_id,
                     message_type="m.room.message",
-                    content={"msgtype": "m.text", "body": chunk},
+                    content={
+                        "msgtype": "m.text",
+                        "body": chunk,
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": html_body,
+                    },
                 )
                 # Store bot response for matrix_read tool
                 if isinstance(resp, RoomSendResponse):
@@ -947,9 +973,21 @@ async def stop_chat_bridge():
 
     if _bot_instance:
         _bot_instance._running = False
+        # Force-close the client to interrupt any pending sync() call
+        if _bot_instance._client:
+            try:
+                # Schedule close on the bot's event loop
+                if _bot_loop and _bot_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        _bot_instance._client.close(), _bot_loop
+                    ).result(timeout=5)
+            except Exception as e:
+                logger.warning("Error closing client during stop: %s", e)
 
     if _bot_thread and _bot_thread.is_alive():
-        _bot_thread.join(timeout=10)
+        _bot_thread.join(timeout=15)
+        if _bot_thread.is_alive():
+            logger.warning("Bot thread did not stop within 15s, it may still be running")
 
     _bot_instance = None
     _bot_thread = None
