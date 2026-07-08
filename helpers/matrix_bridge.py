@@ -3,12 +3,19 @@ Uses matrix-nio's AsyncClient with a sync loop to receive messages
 and routes them through Agent Zero's LLM.
 
 SECURITY MODEL:
-  - Restricted mode (default): Uses call_utility_model() — NO tools, NO code execution,
-    NO file access. The LLM literally cannot perform system operations.
+  - Restricted mode (default): Uses context.communicate() with a restricted system
+    prompt. The agent loop runs (making chats visible in the UI) but the system prompt
+    guides the agent to be conversational only.
   - Elevated mode (opt-in): Authenticated users get full agent loop access via
     context.communicate(). Requires: allow_elevated=true in config + runtime auth
     via !auth <key> in Matrix. Sessions expire after a configurable timeout.
 """
+
+# Context data keys for Matrix integration
+CTX_MX_ROOM = "matrix_room_id"
+CTX_MX_SENDER = "matrix_sender"
+CTX_MX_DISPLAY_NAME = "matrix_display_name"
+CTX_MX_RESTRICTED = "matrix_restricted"
 
 import asyncio
 import base64
@@ -31,6 +38,11 @@ _bot_instance: Optional["ChatBridgeBot"] = None
 _bot_thread: Optional[threading.Thread] = None
 _bot_loop: Optional[asyncio.AbstractEventLoop] = None
 _auto_start_attempted: bool = False
+
+# Watchdog: stores connection params and monitors bot health
+_watchdog_thread: Optional[threading.Thread] = None
+_watchdog_stop = threading.Event()
+_bridge_params: dict = {}  # homeserver, user_id, access_token, password, device_name
 
 ROOM_STATE_FILE = "chat_bridge_state.json"
 
@@ -504,7 +516,7 @@ class ChatBridgeBot:
                                    sender: str, display_name: str,
                                    attachments: list = None) -> str:
         try:
-            from agent import AgentContext, AgentContextType
+            from agent import AgentContext, AgentContextType, UserMessage
             from initialize import initialize_agent
 
             context_id = get_context_id(room_id)
@@ -517,36 +529,38 @@ class ChatBridgeBot:
                 set_context_id(room_id, context.id)
                 logger.info("Created new context %s for room %s", context.id, room_id)
 
+            # Set Matrix context data so extensions can detect this context
+            context.data[CTX_MX_ROOM] = room_id
+            context.data[CTX_MX_SENDER] = sender
+            context.data[CTX_MX_DISPLAY_NAME] = display_name or sender
+            context.data[CTX_MX_RESTRICTED] = True
+
+            # Set a friendly context name for the UI
+            friendly_name = f"Matrix: {display_name or sender}"
+            if not getattr(context, 'name', None):
+                context.name = friendly_name
+
             agent = context.agent0
 
             from usr.plugins.matrix_chat.helpers.sanitize import sanitize_content, sanitize_username
             author_name = sanitize_username(display_name or sender)
             safe_text = sanitize_content(text)
 
-            if room_id not in self._conversations:
-                self._conversations[room_id] = []
-            history = self._conversations[room_id]
-            history.append({"role": "user", "name": author_name, "content": safe_text})
-
-            if len(history) > self.MAX_HISTORY_MESSAGES:
-                self._conversations[room_id] = history[-self.MAX_HISTORY_MESSAGES:]
-                history = self._conversations[room_id]
-
-            formatted = []
-            for msg in history:
-                if msg["role"] == "user":
-                    formatted.append(f"{msg['name']}: {msg['content']}")
-                else:
-                    formatted.append(f"Assistant: {msg['content']}")
-            conversation_text = "\n".join(formatted)
-
-            response = await agent.call_utility_model(
-                system=self.CHAT_SYSTEM_PROMPT,
-                message=conversation_text,
+            # Build user message using the prompt template
+            user_msg = agent.read_prompt(
+                "fw.matrix.user_message.md",
+                sender=author_name,
+                body=safe_text,
             )
 
-            history.append({"role": "assistant", "content": response})
-            return response if isinstance(response, str) else str(response)
+            # Use context.communicate() to run the full agent loop.
+            # This makes the chat visible in the Agent Zero UI.
+            # The restricted system prompt is injected via the system_prompt extension.
+            user_message = UserMessage(message=user_msg, attachments=[])
+            task = context.communicate(user_message)
+            result = await task.result()
+
+            return result if isinstance(result, str) else str(result)
 
         except ImportError:
             return await self._get_agent_response_http(room_id, text, sender, display_name, attachments=attachments)
@@ -620,6 +634,17 @@ class ChatBridgeBot:
                 context = AgentContext(config=config, type=AgentContextType.USER)
                 set_context_id(room_id, context.id)
                 logger.info("Created new elevated context %s for room %s", context.id, room_id)
+
+            # Set Matrix context data so extensions can detect this context
+            context.data[CTX_MX_ROOM] = room_id
+            context.data[CTX_MX_SENDER] = sender
+            context.data[CTX_MX_DISPLAY_NAME] = display_name or sender
+            context.data[CTX_MX_RESTRICTED] = False
+
+            # Set a friendly context name for the UI
+            friendly_name = f"Matrix: {display_name or sender}"
+            if not getattr(context, 'name', None):
+                context.name = friendly_name
 
             from usr.plugins.matrix_chat.helpers.sanitize import sanitize_content
             safe_text = sanitize_content(text)
@@ -706,6 +731,63 @@ def _cleanup_dead_bot():
         _bot_thread = None
         _bot_loop = None
 
+
+def _watchdog_loop():
+    """Background watchdog: restarts the bot if it crashes or dies."""
+    global _bot_instance, _bot_thread, _bot_loop, _bridge_params
+    logger.info("Matrix bridge watchdog started")
+    while not _watchdog_stop.wait(timeout=60):
+        if not _bridge_params:
+            continue
+        if _is_bot_alive():
+            continue
+        logger.warning("Watchdog: bot is dead, attempting restart...")
+        _cleanup_dead_bot()
+        try:
+            bot = ChatBridgeBot(
+                homeserver=_bridge_params["homeserver"],
+                user_id=_bridge_params["user_id"],
+                access_token=_bridge_params.get("access_token", ""),
+                password=_bridge_params.get("password", ""),
+                device_name=_bridge_params.get("device_name", "AgentZero"),
+            )
+            _bot_instance = bot
+            ready_event = threading.Event()
+            thread = threading.Thread(
+                target=_run_bot_in_thread,
+                args=(bot, ready_event),
+                daemon=True,
+                name="matrix-chat-bridge-watchdog",
+            )
+            _bot_thread = thread
+            thread.start()
+            ready_event.wait(timeout=35)
+            if _is_bot_alive():
+                logger.info("Watchdog: bot restarted successfully")
+            else:
+                logger.error("Watchdog: bot restart failed, will retry in 60s")
+        except Exception as e:
+            logger.error("Watchdog: restart error: %s", type(e).__name__, exc_info=True)
+    logger.info("Matrix bridge watchdog stopped")
+
+def _start_watchdog():
+    """Start the watchdog thread if not already running."""
+    global _watchdog_thread, _watchdog_stop
+    if _watchdog_thread and _watchdog_thread.is_alive():
+        return
+    _watchdog_stop.clear()
+    _watchdog_thread = threading.Thread(
+        target=_watchdog_loop, daemon=True, name="matrix-watchdog"
+    )
+    _watchdog_thread.start()
+
+def _stop_watchdog():
+    """Stop the watchdog thread."""
+    global _watchdog_thread, _watchdog_stop
+    _watchdog_stop.set()
+    if _watchdog_thread:
+        _watchdog_thread.join(timeout=5)
+    _watchdog_thread = None
 
 def _run_bot_in_thread(bot: ChatBridgeBot, ready_event: threading.Event):
     """Run the bot in a dedicated thread with its own event loop."""
@@ -811,6 +893,16 @@ async def start_chat_bridge(homeserver: str, user_id: str,
     if _bot_instance and _is_bot_alive():
         return _bot_instance
 
+    # Save connection params for watchdog auto-restart
+    global _bridge_params
+    _bridge_params = {
+        "homeserver": homeserver,
+        "user_id": user_id,
+        "access_token": access_token,
+        "password": password,
+        "device_name": device_name,
+    }
+
     if _bot_instance:
         _bot_instance._running = False
         _bot_instance = None
@@ -841,12 +933,17 @@ async def start_chat_bridge(homeserver: str, user_id: str,
     if not bot._running:
         logger.warning("Bot started but may not be fully ready yet")
 
+    _start_watchdog()
+
     return bot
 
 
 async def stop_chat_bridge():
     """Stop the chat bridge bot."""
     global _bot_instance, _bot_thread, _bot_loop
+
+    _stop_watchdog()
+    _bridge_params.clear()
 
     if _bot_instance:
         _bot_instance._running = False

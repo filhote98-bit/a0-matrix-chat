@@ -36,12 +36,14 @@ class MatrixChat(Tool):
             return self._remove_room()
         elif action == "list":
             return self._list_rooms()
+        elif action == "reload":
+            return await self._reload()
         elif action == "status":
             return self._status()
         else:
             return Response(
                 message=f"Unknown action '{action}'. Use: start, stop, restart, "
-                        f"add_room, remove_room, list, status.",
+                        f"add_room, remove_room, list, status, reload.",
                 break_loop=False,
             )
 
@@ -198,6 +200,94 @@ class MatrixChat(Tool):
             lines.append("\nBot status: not running")
 
         return Response(message="\n".join(lines), break_loop=False)
+
+    async def _reload(self) -> Response:
+        """Reload the matrix_bridge module and restart the bridge.
+        This picks up code changes without restarting the whole agent process."""
+        import importlib
+        import sys
+
+        self.set_progress("Reloading Matrix bridge module...")
+
+        # Find and stop the existing bridge
+        matrix_modules = [k for k in sys.modules if 'matrix_bridge' in k]
+        for k in matrix_modules:
+            mod = sys.modules.get(k)
+            if mod and hasattr(mod, 'stop_chat_bridge'):
+                try:
+                    await mod.stop_chat_bridge()
+                except Exception as e:
+                    pass
+                break
+
+        # Reload all matrix-related modules
+        reloaded = []
+        for k in sorted(matrix_modules):
+            try:
+                importlib.reload(sys.modules[k])
+                reloaded.append(k)
+            except Exception as e:
+                return Response(
+                    message=f"Failed to reload {k}: {type(e).__name__}: {e}",
+                    break_loop=False,
+                )
+
+        # Also reload the system_prompt extension if loaded
+        ext_modules = [k for k in sys.modules if 'matrix' in k.lower() and 'extension' in k.lower()]
+        for k in sorted(ext_modules):
+            try:
+                importlib.reload(sys.modules[k])
+                reloaded.append(k)
+            except Exception:
+                pass
+
+        # Start the bridge with the reloaded module
+        config = get_matrix_config(self.agent)
+        server = config.get("server", {})
+        homeserver = (server.get("homeserver", "") or "").strip()
+        user_id = (server.get("user_id", "") or "").strip()
+        access_token = (server.get("access_token", "") or "").strip()
+        password = (server.get("password", "") or "").strip()
+        device_name = (server.get("device_name", "") or "AgentZero").strip()
+
+        if not homeserver:
+            return Response(
+                message="Error: Homeserver not configured.",
+                break_loop=False,
+            )
+
+        try:
+            # Get the reloaded module
+            bridge_mod = None
+            for k in matrix_modules:
+                mod = sys.modules.get(k)
+                if mod and hasattr(mod, 'start_chat_bridge'):
+                    bridge_mod = mod
+                    break
+            if not bridge_mod:
+                return Response(
+                    message="Could not find reloaded bridge module.",
+                    break_loop=False,
+                )
+
+            await bridge_mod.start_chat_bridge(
+                homeserver=homeserver,
+                user_id=user_id,
+                access_token=access_token,
+                password=password,
+                device_name=device_name,
+            )
+            status = bridge_mod.get_bot_status()
+            return Response(
+                message=f"Matrix bridge reloaded and restarted as **{status.get('user', 'unknown')}**.\n"
+                        f"Reloaded modules: {', '.join(reloaded)}",
+                break_loop=False,
+            )
+        except Exception as e:
+            return Response(
+                message=f"Error starting bridge after reload: {type(e).__name__}: {e}",
+                break_loop=False,
+            )
 
     def _status(self) -> Response:
         status = get_bot_status()
