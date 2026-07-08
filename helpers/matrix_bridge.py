@@ -760,23 +760,62 @@ def _cleanup_dead_bot():
 
 def _kill_all_bot_threads(timeout: float = 20.0):
     """Find and stop ALL matrix bridge threads by name, even orphaned ones.
-    This survives module reloads since it uses threading.enumerate() not globals."""
+    Uses ctypes as nuclear option to interrupt threads blocked in sync()."""
     import threading as _th
-    bots_to_stop = []
+    import time as _time
+    import ctypes
+    import inspect
+
+    def _async_raise(tid, exctype=SystemExit):
+        if not inspect.isclass(exctype):
+            exctype = type(exctype)
+        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_long(tid), ctypes.py_object(exctype))
+        if res == 0:
+            return False
+        if res != 1:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), None)
+            return False
+        return True
+
+    # Phase 1: graceful shutdown — set _running=False and try to close client
     for t in _th.enumerate():
         if not t.is_alive():
             continue
-        if t.name.startswith("matrix-chat-bridge") or t.name == "matrix-watchdog":
-            # Try to access bot instance from thread args: (bot, ready_event)
+        if t.name.startswith("matrix-chat-bridge"):
             try:
                 args = getattr(t, "_args", ())
                 if args and hasattr(args[0], "_running"):
-                    args[0]._running = False
-                    bots_to_stop.append(args[0])
+                    bot = args[0]
+                    bot._running = False
+                    client = getattr(bot, "_client", None)
+                    loop = getattr(bot, "_bot_loop", None)
+                    if client and loop and loop.is_running():
+                        try:
+                            import asyncio
+                            asyncio.run_coroutine_threadsafe(
+                                client.close(), loop
+                            ).result(timeout=3)
+                        except Exception:
+                            pass
             except Exception:
                 pass
-    # Wait for all bot threads to die
-    import time as _time
+
+    # Phase 2: wait briefly for graceful shutdown
+    _time.sleep(2)
+
+    # Phase 3: nuclear — inject exception into surviving threads
+    for attempt in range(3):
+        zombies = [t for t in _th.enumerate()
+                   if t.is_alive() and t.name.startswith("matrix-chat-bridge")]
+        if not zombies:
+            break
+        for t in zombies:
+            logger.warning("Nuking zombie thread: %s (attempt %d)", t.name, attempt + 1)
+            _async_raise(t.ident)
+        _time.sleep(1)
+
+    # Phase 4: final wait
     deadline = _time.monotonic() + timeout
     while _time.monotonic() < deadline:
         alive = [t for t in _th.enumerate()
@@ -784,11 +823,13 @@ def _kill_all_bot_threads(timeout: float = 20.0):
         if not alive:
             break
         _time.sleep(0.5)
-    # Log if threads are still alive
+
     still_alive = [t for t in _th.enumerate()
                    if t.is_alive() and (t.name.startswith("matrix-chat-bridge") or t.name == "matrix-watchdog")]
     if still_alive:
         logger.warning("%d matrix threads still alive after kill_all", len(still_alive))
+    else:
+        logger.info("All matrix threads killed successfully")
 
 def _watchdog_loop():
     """Background watchdog: restarts the bot if it crashes or dies."""
@@ -854,6 +895,7 @@ def _run_bot_in_thread(bot: ChatBridgeBot, ready_event: threading.Event):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _bot_loop = loop
+    bot._bot_loop = loop  # Store on instance for _kill_all_bot_threads
 
     bot._ready_event = ready_event
 
