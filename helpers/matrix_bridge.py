@@ -758,6 +758,38 @@ def _cleanup_dead_bot():
         _bot_loop = None
 
 
+def _kill_all_bot_threads(timeout: float = 20.0):
+    """Find and stop ALL matrix bridge threads by name, even orphaned ones.
+    This survives module reloads since it uses threading.enumerate() not globals."""
+    import threading as _th
+    bots_to_stop = []
+    for t in _th.enumerate():
+        if not t.is_alive():
+            continue
+        if t.name.startswith("matrix-chat-bridge") or t.name == "matrix-watchdog":
+            # Try to access bot instance from thread args: (bot, ready_event)
+            try:
+                args = getattr(t, "_args", ())
+                if args and hasattr(args[0], "_running"):
+                    args[0]._running = False
+                    bots_to_stop.append(args[0])
+            except Exception:
+                pass
+    # Wait for all bot threads to die
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        alive = [t for t in _th.enumerate()
+                 if t.is_alive() and (t.name.startswith("matrix-chat-bridge") or t.name == "matrix-watchdog")]
+        if not alive:
+            break
+        _time.sleep(0.5)
+    # Log if threads are still alive
+    still_alive = [t for t in _th.enumerate()
+                   if t.is_alive() and (t.name.startswith("matrix-chat-bridge") or t.name == "matrix-watchdog")]
+    if still_alive:
+        logger.warning("%d matrix threads still alive after kill_all", len(still_alive))
+
 def _watchdog_loop():
     """Background watchdog: restarts the bot if it crashes or dies."""
     global _bot_instance, _bot_thread, _bot_loop, _bridge_params
@@ -915,6 +947,7 @@ async def start_chat_bridge(homeserver: str, user_id: str,
         raise ValueError("Cannot start chat bridge: homeserver URL is empty.")
 
     _cleanup_dead_bot()
+    _kill_all_bot_threads(timeout=20)
 
     if _bot_instance and _is_bot_alive():
         return _bot_instance

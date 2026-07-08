@@ -209,7 +209,7 @@ class MatrixChat(Tool):
 
         self.set_progress("Reloading Matrix bridge module...")
 
-        # Find and stop the existing bridge
+        # Find and stop the existing bridge — be very defensive
         matrix_modules = [k for k in sys.modules if 'matrix_bridge' in k]
         for k in matrix_modules:
             mod = sys.modules.get(k)
@@ -219,6 +219,37 @@ class MatrixChat(Tool):
                 except Exception as e:
                     pass
                 break
+
+        # Extra safety: directly kill any remaining bot threads
+        for k in matrix_modules:
+            mod = sys.modules.get(k)
+            if mod:
+                # Force-stop any lingering bot instance
+                bot = getattr(mod, '_bot_instance', None)
+                if bot:
+                    bot._running = False
+                    if getattr(bot, '_client', None):
+                        try:
+                            loop = getattr(mod, '_bot_loop', None)
+                            if loop and loop.is_running():
+                                import asyncio
+                                asyncio.run_coroutine_threadsafe(
+                                    bot._client.close(), loop
+                                ).result(timeout=5)
+                        except Exception:
+                            pass
+                # Stop watchdog
+                wd = getattr(mod, '_watchdog_thread', None)
+                if wd:
+                    try:
+                        getattr(mod, '_watchdog_stop').set()
+                        wd.join(timeout=3)
+                    except Exception:
+                        pass
+                # Wait for bot thread to die
+                bt = getattr(mod, '_bot_thread', None)
+                if bt and bt.is_alive():
+                    bt.join(timeout=15)
 
         # Reload all matrix-related modules
         reloaded = []
