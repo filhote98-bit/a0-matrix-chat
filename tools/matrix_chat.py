@@ -38,6 +38,8 @@ class MatrixChat(Tool):
             return self._list_rooms()
         elif action == "reload":
             return await self._reload()
+        elif action == "nuke":
+            return await self._nuke()
         elif action == "status":
             return self._status()
         else:
@@ -200,6 +202,44 @@ class MatrixChat(Tool):
             lines.append("\nBot status: not running")
 
         return Response(message="\n".join(lines), break_loop=False)
+
+    async def _nuke(self) -> Response:
+        """Kill ALL matrix bot threads using ctypes and restart with a single instance.
+        This runs in the agent's main process, so it can see and kill zombie threads."""
+        self.set_progress("Nuking all matrix bot threads...")
+        try:
+            import usr.plugins.matrix_chat.helpers.matrix_bridge as bridge
+            bridge._kill_all_bot_threads(timeout=25)
+            bridge._bot_instance = None
+            bridge._bot_thread = None
+            bridge._bot_loop = None
+            bridge._watchdog_thread = None
+            bridge._watchdog_stop.clear()
+            bridge._auto_start_attempted = True
+            config = get_matrix_config(self.agent)
+            server = config.get("server", {})
+            homeserver = (server.get("homeserver", "") or "").strip()
+            user_id = (server.get("user_id", "") or "").strip()
+            access_token = (server.get("access_token", "") or "").strip()
+            password = (server.get("password", "") or "").strip()
+            device_name = (server.get("device_name", "") or "AgentZero").strip()
+            await bridge.start_chat_bridge(
+                homeserver=homeserver,
+                user_id=user_id,
+                access_token=access_token,
+                password=password,
+                device_name=device_name,
+            )
+            status = bridge.get_bot_status()
+            return Response(
+                message=f"Nuke complete. Bridge restarted as **{status.get('user', 'unknown')}**.",
+                break_loop=False,
+            )
+        except Exception as e:
+            return Response(
+                message=f"Nuke failed: {type(e).__name__}: {e}",
+                break_loop=False,
+            )
 
     async def _reload(self) -> Response:
         """Reload the matrix_bridge module and restart the bridge.
